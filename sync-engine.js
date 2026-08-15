@@ -189,8 +189,9 @@ const SupaService = (() => {
   }
   async function signOut() {
     const c = getClient(); if (!c) return;
-    try { await c.auth.signOut(); } catch (e) { /* session already gone, ignore */ }
+    try { await c.auth.signOut(); } catch (e) { /* session already gone, ignore 403 */ }
   }
+
   async function upsert(table, row) {
     const c = getClient(); if (!c) throw new Error('offline');
     const { error } = await c.from(table).upsert(row, { onConflict: 'id' });
@@ -357,6 +358,31 @@ const SyncEngine = (() => {
     return match ? match.name : null;
   }
 
+  // Every fresh device seeds its own local default categories (Salary, Food,
+  // etc.) with device-generated ids before it has ever synced. If this isn't
+  // the FIRST device to ever sync this account, those same-named categories
+  // already exist remotely under different ids — pushing them again would
+  // violate the database's one-name-per-kind-per-user rule and fail forever.
+  // Fix: on first sign-in, pull the remote category list and, for any local
+  // category whose (kind, name) already exists remotely, adopt the remote id
+  // in place. Nothing else needs updating — transactions reference categories
+  // by NAME locally, not by id, so this rewrite is fully self-contained.
+  async function reconcileCategoriesOnFirstSignIn(db) {
+    let remoteCats;
+    try { remoteCats = await SupaService.fetchChangedSince('categories', session.user.id, null); }
+    catch (e) { return; } // offline/error — proceed without reconciling; worst case, resolve manually later
+    if (!remoteCats || !remoteCats.length) return;
+    const byKindName = new Map(
+      remoteCats.filter(r => !r.is_deleted).map(r => [r.kind + '::' + r.name, r.id])
+    );
+    const reconcile = (arr, kind) => (arr || []).forEach(c => {
+      const remoteId = byKindName.get(kind + '::' + c.name);
+      if (remoteId && remoteId !== c.id) c.id = remoteId;
+    });
+    reconcile(db.categoriesIncome, 'income');
+    reconcile(db.categoriesExpense, 'expense');
+  }
+
   function toAccountRow(a) {
     return {
       id: a.id, user_id: rowUserId(), name: a.name, type: a.type, icon: a.icon,
@@ -380,6 +406,7 @@ const SyncEngine = (() => {
     };
   }
   function toTransactionRow(t, db) {
+    if (!isUUID(t.id)) return null; // skip legacy non-UUID ids
     return {
       id: t.id, user_id: rowUserId(), type: t.type, date: t.date, amount: t.amount,
       account_id: t.accountId, category_id: resolveCategoryId(db, t.type, t.category),
@@ -419,6 +446,7 @@ const SyncEngine = (() => {
             : table === 'categories' ? toCategoryRow(rec)
             : table === 'investments' ? toInvestmentRow(rec)
             : toTransactionRow(rec, db);
+          if (!row) continue; // skip unmappable rows (e.g. legacy non-UUID ids)
           await SyncOutbox.push({ table, op: 'upsert', id, row });
         }
       }
@@ -461,13 +489,25 @@ const SyncEngine = (() => {
 
     const order = [...TABLE_ORDER, 'settings'];
     let anyFailed = dead.length > 0;
+    const uid = session.user.id;
+    // Always stamp the CURRENT signed-in user's id onto every row right
+    // before upload, overriding whatever was baked in when the item was
+    // originally queued. This matters because items can be queued before
+    // sign-in ever happens (offline-first: the app tracks changes from the
+    // very first launch) — those rows had no valid user_id at queue time,
+    // and mixing them into a batch with correctly-attributed rows made the
+    // whole batch fail (Supabase's bulk upsert requires every row in a
+    // batch to share the same set of fields). Restamping here guarantees
+    // every uploaded row is correctly attributed regardless of when it was
+    // originally created.
+    const stamp = (row) => ({ ...row, user_id: uid });
     for (const table of order) {
       const batch = items.filter(i => i.table === table);
       if (!batch.length) continue;
 
       if (table === 'settings') {
         for (const item of batch) {
-          try { await SupaService.upsertSettings(item.row); await SyncOutbox.remove(table, item.id); }
+          try { await SupaService.upsertSettings(stamp(item.row)); await SyncOutbox.remove(table, item.id); }
           catch (e) { anyFailed = true; await SyncOutbox.bumpAttempts(table, item.id); }
         }
         continue;
@@ -478,7 +518,7 @@ const SyncEngine = (() => {
       const deletes = batch.filter(i => i.op === 'delete');
       if (upserts.length) {
         try {
-          await SupaService.upsertBatch(table, upserts.map(i => i.row));
+          await SupaService.upsertBatch(table, upserts.map(i => stamp(i.row)));
           for (const i of upserts) await SyncOutbox.remove(table, i.id);
         } catch (e) {
           anyFailed = true;
@@ -624,8 +664,13 @@ const SyncEngine = (() => {
         return;
       }
       if (wasSignedOut) {
-        // First sign-in on this device: push everything local up, then pull.
+        // First sign-in on this device: reconcile category ids against
+        // whatever already exists remotely (see reconcileCategoriesOnFirstSignIn),
+        // THEN push everything local up, then pull.
         lastSnapshot = null;
+        const db = applyToDb.get();
+        await reconcileCategoriesOnFirstSignIn(db);
+        applyToDb.set(db);
         await notifyLocalChange(applyToDb.get());
         await flush();
       }
