@@ -384,12 +384,14 @@ const SyncEngine = (() => {
   }
 
   function toAccountRow(a) {
+    if (!isUUID(a.id)) return null; // skip legacy non-UUID ids
     return {
       id: a.id, user_id: rowUserId(), name: a.name, type: a.type, icon: a.icon,
       color: a.color, opening_balance: a.openingBalance || 0
     };
   }
   function toCategoryRow(c) {
+    if (!isUUID(c.id)) return null; // skip legacy non-UUID ids
     return {
       id: c.id, user_id: rowUserId(), kind: c.kind, name: c.name,
       icon: c.icon, color: c.color, locked: !!c.locked
@@ -666,14 +668,14 @@ const SyncEngine = (() => {
         return;
       }
       if (wasSignedOut) {
-  // On first sign-in, server data wins.
-  // Clear local outbox and snapshot so we don't push stale local data.
-  await IDB.set('outbox', []);
-  await IDB.set('sync_meta', { lastPulledAt: {} });
-  lastSnapshot = null;
-}
-await pullRemoteChanges(applyToDb, rerender);
-rerender && rerender();
+        // First sign-in on this device: server wins.
+        // Clear local outbox and sync meta so stale local data is not pushed.
+        // Pull from Supabase replaces local state cleanly.
+        await IDB.set('outbox', []);
+        await IDB.set('sync_meta', { lastPulledAt: {} });
+        lastSnapshot = null;
+      }
+      await pullRemoteChanges(applyToDb, rerender);
       rerender && rerender(); // reflect the now-signed-in state immediately (e.g. Settings screen)
     });
 
