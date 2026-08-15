@@ -396,12 +396,14 @@ const SyncEngine = (() => {
     };
   }
   function toInvestmentRow(inv) {
+    if (!isUUID(inv.id)) return null; // skip legacy non-UUID ids
     return {
       id: inv.id, user_id: rowUserId(), name: inv.name, category: inv.category,
       purchase_date: inv.purchaseDate, purchase_price: inv.purchasePrice || null,
       quantity: inv.quantity || null, invested_amount: inv.investedAmount || 0,
       current_value: inv.currentValue || 0, notes: inv.notes || null,
-      history: inv.history || [], linked_expense_id: inv.linkedExpenseId || null,
+      history: inv.history || [],
+      linked_expense_id: (inv.linkedExpenseId && isUUID(inv.linkedExpenseId)) ? inv.linkedExpenseId : null,
       txn_id: inv.txnId || null, closed: !!inv.closed
     };
   }
@@ -446,7 +448,7 @@ const SyncEngine = (() => {
             : table === 'categories' ? toCategoryRow(rec)
             : table === 'investments' ? toInvestmentRow(rec)
             : toTransactionRow(rec, db);
-          if (!row) continue; // skip unmappable rows (e.g. legacy non-UUID ids)
+          if (row === null || row === undefined) continue; // skip unmappable rows (e.g. legacy non-UUID ids)
           await SyncOutbox.push({ table, op: 'upsert', id, row });
         }
       }
