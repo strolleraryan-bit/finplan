@@ -131,7 +131,7 @@ const SupaService = (() => {
     if (client) return client;
     if (typeof window === 'undefined' || !window.supabase) return null;
     client = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-      auth: { persistSession: true, autoRefreshToken: true }
+      auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true }
     });
     return client;
   }
@@ -197,6 +197,13 @@ const SupaService = (() => {
     const { error } = await c.from(table).upsert(row, { onConflict: 'id' });
     if (error) throw error;
   }
+  // Batched upsert — used by flush() so a bulk sync (e.g. years of existing
+  // data on first sign-in) is a handful of requests instead of one per row.
+  async function upsertBatch(table, rows) {
+    const c = getClient(); if (!c) throw new Error('offline');
+    const { error } = await c.from(table).upsert(rows, { onConflict: 'id' });
+    if (error) throw error;
+  }
   async function upsertSettings(row) {
     const c = getClient(); if (!c) throw new Error('offline');
     const { error } = await c.from('settings').upsert(row, { onConflict: 'user_id' });
@@ -209,13 +216,30 @@ const SupaService = (() => {
       .eq('id', id);
     if (error) throw error;
   }
+  async function softDeleteBatch(table, ids) {
+    const c = getClient(); if (!c) throw new Error('offline');
+    const { error } = await c.from(table)
+      .update({ is_deleted: true, deleted_at: new Date().toISOString() })
+      .in('id', ids);
+    if (error) throw error;
+  }
+  // Paginated: a long offline stretch with heavy multi-device edits could mean
+  // thousands of changed rows since the last pull. Fetch in pages rather than
+  // one unbounded request.
   async function fetchChangedSince(table, userId, sinceIso) {
     const c = getClient(); if (!c) throw new Error('offline');
-    let q = c.from(table).select('*').eq('user_id', userId);
-    q = sinceIso ? q.gt('updated_at', sinceIso) : q;
-    const { data, error } = await q;
-    if (error) throw error;
-    return data || [];
+    const PAGE = 500;
+    let all = [], from = 0;
+    while (true) {
+      let q = c.from(table).select('*').eq('user_id', userId).order('updated_at', { ascending: true });
+      q = sinceIso ? q.gt('updated_at', sinceIso) : q;
+      const { data, error } = await q.range(from, from + PAGE - 1);
+      if (error) throw error;
+      all = all.concat(data || []);
+      if (!data || data.length < PAGE) break;
+      from += PAGE;
+    }
+    return all;
   }
   async function fetchSettings(userId) {
     const c = getClient(); if (!c) throw new Error('offline');
@@ -228,7 +252,8 @@ const SupaService = (() => {
     getClient, getSession, onAuthStateChange, signInWithMagicLink, signOut,
     signUpWithPassword, signInWithPassword, signInWithGoogle,
     resetPasswordForEmail, updatePassword,
-    upsert, upsertSettings, softDelete, fetchChangedSince, fetchSettings
+    upsert, upsertBatch, upsertSettings, softDelete, softDeleteBatch,
+    fetchChangedSince, fetchSettings
   };
 })();
 
@@ -317,13 +342,21 @@ const SyncEngine = (() => {
   }
 
   /* ---- Row builders: local record shape -> Supabase row shape ---- */
-  function findCategoryName(db, kind, name) {
-    // local transactions store the category as a NAME, not an id. Nothing
-    // to translate here — Supabase's row also just needs category left
-    // out (category_id stays null) since matching by name is done app-side.
-    return name;
-  }
   function rowUserId() { return session && session.user && session.user.id; }
+  // Local transactions store the category as a NAME string, but the remote
+  // schema has a proper category_id FK. Categories always sync before
+  // transactions (TABLE_ORDER), and ids are unified UUIDs post-migration, so
+  // we resolve the real id here instead of leaving the column empty.
+  function resolveCategoryId(db, type, categoryName) {
+    const list = type === 'income' ? db.categoriesIncome : db.categoriesExpense;
+    const match = (list || []).find(c => c.name === categoryName);
+    return match ? match.id : null;
+  }
+  function resolveCategoryName(db, kind, categoryId) {
+    const list = kind === 'income' ? db.categoriesIncome : db.categoriesExpense;
+    const match = (list || []).find(c => c.id === categoryId);
+    return match ? match.name : null;
+  }
 
   function toAccountRow(a) {
     return {
@@ -347,10 +380,11 @@ const SyncEngine = (() => {
       txn_id: inv.txnId || null, closed: !!inv.closed
     };
   }
-  function toTransactionRow(t) {
+  function toTransactionRow(t, db) {
     return {
       id: t.id, user_id: rowUserId(), type: t.type, date: t.date, amount: t.amount,
-      account_id: t.accountId, category_id: null, notes: t.notes || null,
+      account_id: t.accountId, category_id: resolveCategoryId(db, t.type, t.category),
+      notes: t.notes || null,
       tags: t.tags || [], location: t.location || null, attachment: t.attachment || null,
       credit: t.credit || null, loan: t.loan || null, reminder: t.reminder || null,
       linked_investment_id: t.linkedInvestmentId || null, realized_pl: t.realizedPL ?? null,
@@ -385,7 +419,7 @@ const SyncEngine = (() => {
           const row = table === 'accounts' ? toAccountRow(rec)
             : table === 'categories' ? toCategoryRow(rec)
             : table === 'investments' ? toInvestmentRow(rec)
-            : toTransactionRow(rec);
+            : toTransactionRow(rec, db);
           await SyncOutbox.push({ table, op: 'upsert', id, row });
         }
       }
@@ -406,40 +440,68 @@ const SyncEngine = (() => {
     flushTimer = setTimeout(flush, 1500); // debounce rapid edits
   }
 
-  /* ---- Push queued ops to Supabase, table-by-table, with retry ---- */
+  const MAX_ATTEMPTS = 10; // stop retrying a permanently-failing item (e.g. a
+  // duplicate-name constraint violation) after this many tries, instead of
+  // hammering the API forever every retry cycle.
+
+  /* ---- Push queued ops to Supabase, table-by-table, batched, with retry ---- */
   async function flush() {
     if (!navigator.onLine) { setStatus('offline'); return; }
     if (!session) { setStatus('signed-out'); return; }
-    const items = await SyncOutbox.load();
+    let items = await SyncOutbox.load();
     if (items.length === 0) { setStatus('synced'); return; }
     setStatus('syncing');
 
+    // Drop anything that's failed too many times in a row so it doesn't
+    // retry forever — surface it as an error instead of silently looping.
+    const dead = items.filter(i => (i.attempts || 0) >= MAX_ATTEMPTS);
+    if (dead.length) {
+      items = items.filter(i => (i.attempts || 0) < MAX_ATTEMPTS);
+      await SyncOutbox.save(items.concat(dead)); // keep them queued but excluded from this pass
+    }
+
     const order = [...TABLE_ORDER, 'settings'];
-    let anyFailed = false;
+    let anyFailed = dead.length > 0;
     for (const table of order) {
       const batch = items.filter(i => i.table === table);
-      for (const item of batch) {
+      if (!batch.length) continue;
+
+      if (table === 'settings') {
+        for (const item of batch) {
+          try { await SupaService.upsertSettings(item.row); await SyncOutbox.remove(table, item.id); }
+          catch (e) { anyFailed = true; await SyncOutbox.bumpAttempts(table, item.id); }
+        }
+        continue;
+      }
+
+      // Batch upserts and batch deletes each into a single request per table.
+      const upserts = batch.filter(i => i.op === 'upsert');
+      const deletes = batch.filter(i => i.op === 'delete');
+      if (upserts.length) {
         try {
-          if (table === 'settings') {
-            await SupaService.upsertSettings(item.row);
-          } else if (item.op === 'delete') {
-            await SupaService.softDelete(table, item.id);
-          } else {
-            await SupaService.upsert(table, item.row);
-          }
-          await SyncOutbox.remove(table, item.id);
+          await SupaService.upsertBatch(table, upserts.map(i => i.row));
+          for (const i of upserts) await SyncOutbox.remove(table, i.id);
         } catch (e) {
           anyFailed = true;
-          await SyncOutbox.bumpAttempts(table, item.id);
-          // Common transient case: an investment references a transaction
-          // (or vice versa) that hasn't uploaded yet in this same cycle.
-          // Leaving it queued means the next flush cycle (a few seconds
-          // later, once the sibling record has synced) resolves it.
+          for (const i of upserts) await SyncOutbox.bumpAttempts(table, i.id);
+          // Common transient case: an investment references a transaction (or
+          // vice versa) that hasn't uploaded yet in this same cycle. Leaving
+          // it queued means the next flush cycle resolves it once the sibling
+          // record has synced.
+        }
+      }
+      if (deletes.length) {
+        try {
+          await SupaService.softDeleteBatch(table, deletes.map(i => i.id));
+          for (const i of deletes) await SyncOutbox.remove(table, i.id);
+        } catch (e) {
+          anyFailed = true;
+          for (const i of deletes) await SyncOutbox.bumpAttempts(table, i.id);
         }
       }
     }
-    setStatus(anyFailed ? 'syncing' : 'synced');
-    if (anyFailed) flushTimer = setTimeout(flush, 8000); // backoff retry
+    setStatus(anyFailed ? (dead.length ? 'error' : 'syncing') : 'synced');
+    if (anyFailed && !dead.length) flushTimer = setTimeout(flush, 8000); // backoff retry
   }
 
   /* ---- Pull remote changes down and merge into local DB ---- */
@@ -450,14 +512,23 @@ const SyncEngine = (() => {
     let changed = false;
 
     try {
+      // Records with a pending local edit still in the outbox must not be
+      // clobbered by an incoming (older, by definition) remote version —
+      // our local edit is already queued to overwrite it. Skip merging
+      // those specific records this cycle; they'll reconcile once our own
+      // push lands and the next pull sees the newer server state.
+      const pendingIds = new Set((await SyncOutbox.load()).map(i => i.table + '::' + i.id));
+
       for (const table of TABLE_ORDER) {
         const since = meta.lastPulledAt[table];
         const rows = await SupaService.fetchChangedSince(table, uid, since);
-        if (rows.length) { mergeRemoteRows(table, rows, applyToDb); changed = true; }
+        if (rows.length) { mergeRemoteRows(table, rows, applyToDb, pendingIds); changed = true; }
         meta.lastPulledAt[table] = new Date().toISOString();
       }
       const settingsRow = await SupaService.fetchSettings(uid);
-      if (settingsRow) { mergeRemoteSettings(settingsRow, applyToDb); changed = true; }
+      if (settingsRow && !pendingIds.has('settings::singleton')) {
+        mergeRemoteSettings(settingsRow, applyToDb); changed = true;
+      }
       await IDB.set('sync_meta', meta);
       if (changed) { lastSnapshot = snapshotOf(applyToDb.get()); rerender && rerender(); }
       setStatus('synced');
@@ -466,14 +537,15 @@ const SyncEngine = (() => {
     }
   }
 
-  function mergeRemoteRows(table, rows, applyToDb) {
+  function mergeRemoteRows(table, rows, applyToDb, pendingIds) {
     const db = applyToDb.get();
     rows.forEach(r => {
+      if (pendingIds && pendingIds.has(table + '::' + r.id)) return; // local edit pending, don't overwrite
       if (table === 'accounts') mergeInto(db.accounts, fromAccountRow(r), r);
       if (table === 'investments') mergeInto(db.investments, fromInvestmentRow(r), r);
       if (table === 'transactions') {
         const arr = r.type === 'income' ? db.income : db.expense;
-        mergeInto(arr, fromTransactionRow(r), r);
+        mergeInto(arr, fromTransactionRow(r, db), r);
       }
       if (table === 'categories') {
         const arr = r.kind === 'income' ? db.categoriesIncome : db.categoriesExpense;
@@ -512,9 +584,10 @@ const SyncEngine = (() => {
       linkedExpenseId: r.linked_expense_id, txnId: r.txn_id, closed: r.closed
     };
   }
-  function fromTransactionRow(r) {
+  function fromTransactionRow(r, db) {
     return {
-      id: r.id, date: r.date, amount: r.amount, accountId: r.account_id, category: r.category_name || r.category,
+      id: r.id, date: r.date, amount: r.amount, accountId: r.account_id,
+      category: resolveCategoryName(db, r.type, r.category_id) || '',
       notes: r.notes, tags: r.tags || [], location: r.location, attachment: r.attachment,
       credit: r.credit, loan: r.loan, reminder: r.reminder, linkedInvestmentId: r.linked_investment_id,
       realizedPL: r.realized_pl, txnId: r.txn_id
@@ -567,7 +640,14 @@ const SyncEngine = (() => {
     });
     window.addEventListener('offline', () => setStatus('offline'));
 
-    if (session) await pullRemoteChanges(applyToDb, rerender);
+    if (session) {
+      // Resume any changes still sitting in the outbox from a previous
+      // session (e.g. the app was closed before they finished uploading)
+      // instead of waiting for the user's next edit to trigger a flush.
+      const pending = await SyncOutbox.load();
+      if (pending.length && navigator.onLine) await flush();
+      await pullRemoteChanges(applyToDb, rerender);
+    }
 
     if (pullTimer) clearInterval(pullTimer);
     pullTimer = setInterval(() => {
