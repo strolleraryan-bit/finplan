@@ -666,17 +666,14 @@ const SyncEngine = (() => {
         return;
       }
       if (wasSignedOut) {
-        // First sign-in on this device: reconcile category ids against
-        // whatever already exists remotely (see reconcileCategoriesOnFirstSignIn),
-        // THEN push everything local up, then pull.
-        lastSnapshot = null;
-        const db = applyToDb.get();
-        await reconcileCategoriesOnFirstSignIn(db);
-        applyToDb.set(db);
-        await notifyLocalChange(applyToDb.get());
-        await flush();
-      }
-      await pullRemoteChanges(applyToDb, rerender);
+  // On first sign-in, server data wins.
+  // Clear local outbox and snapshot so we don't push stale local data.
+  await IDB.set('outbox', []);
+  await IDB.set('sync_meta', { lastPulledAt: {} });
+  lastSnapshot = null;
+}
+await pullRemoteChanges(applyToDb, rerender);
+rerender && rerender();
       rerender && rerender(); // reflect the now-signed-in state immediately (e.g. Settings screen)
     });
 
