@@ -189,9 +189,8 @@ const SupaService = (() => {
   }
   async function signOut() {
     const c = getClient(); if (!c) return;
-    await c.auth.signOut();
+    try { await c.auth.signOut(); } catch (e) { /* session already gone, ignore */ }
   }
-
   async function upsert(table, row) {
     const c = getClient(); if (!c) throw new Error('offline');
     const { error } = await c.from(table).upsert(row, { onConflict: 'id' });
