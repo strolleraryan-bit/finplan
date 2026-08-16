@@ -20,7 +20,7 @@
 const SUPABASE_URL = 'https://cbauurxbzlbjfxudbshh.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNiYXV1cnhiemxiamZ4dWRic2hoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODY3MjE4NjgsImV4cCI6MjEwMjI5Nzg2OH0.IlR3wDhWpyil6vtNm2SCOeojc1bdVjX_c9NxI3j5p90';
 
-const IDB_STATE_KEY = 'app_state';
+const SYNC_STATE_KEY = 'app_state';
 const OUTBOX_KEY = 'outbox';
 const PULL_INTERVAL_MS = 20000; // 20s
 
@@ -441,7 +441,7 @@ const SyncEngine = (() => {
       }
 
       applyToDbRef.set(db);
-      await IDB.set(IDB_STATE_KEY, db);
+      await IDB.set(SYNC_STATE_KEY, db);
       setStatus('synced');
       OfflineBanner.hide();
       rerenderRef && rerenderRef();
@@ -497,7 +497,7 @@ const SyncEngine = (() => {
       if (!uid) {
         // Signed out (explicitly or session expired/invalidated)
         recoveryMode = false;
-        await IDB.set(IDB_STATE_KEY, null);
+        await IDB.set(SYNC_STATE_KEY, null);
         await Outbox.clear();
         if (pullTimer) clearInterval(pullTimer);
         setStatus('signed-out');
@@ -547,7 +547,7 @@ const SyncEngine = (() => {
     await SupaService.signOut();
     uid = null; session = null; recoveryMode = false;
     if (pullTimer) clearInterval(pullTimer);
-    await IDB.set(IDB_STATE_KEY, null);
+    await IDB.set(SYNC_STATE_KEY, null);
     await Outbox.clear();
     setStatus('signed-out');
   }
