@@ -214,6 +214,11 @@ const SupaService = (() => {
     const c = getClient(); if (!c) return;
     try { await c.auth.signOut(); } catch (e) { /* session already gone, ignore 403 */ }
   }
+  async function clearLocal() {
+    await IDB.set('app_state', null);
+    await IDB.set('outbox', []);
+    await IDB.set('sync_meta', { lastPulledAt: {} });
+  }
 
   async function upsert(table, row) {
     const c = getClient(); if (!c) throw new Error('offline');
@@ -759,7 +764,9 @@ const SyncEngine = (() => {
   function currentEmail() { return session && session.user && session.user.email; }
 
   return {
-    init, notifyLocalChange, signIn, signUp, signInPassword, signInGoogle,
+    init, notifyLocalChange,
+    pull: (applyToDb, rerender) => pullRemoteChanges(applyToDb, rerender),
+    signIn, signUp, signInPassword, signInGoogle,
     resetPassword, updatePassword, isPasswordRecovery, clearRecoveryMode,
     signOut, isSignedIn, currentEmail, getStatus, onStatusChange
   };
