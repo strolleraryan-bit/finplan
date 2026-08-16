@@ -82,6 +82,29 @@ const IDB = (() => {
 --------------------------------------------------------------------------- */
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 function isUUID(v) { return typeof v === 'string' && UUID_RE.test(v); }
+
+/* ---------------------------------------------------------------------------
+   OFFLINE BANNER — shown when navigator.onLine is false
+--------------------------------------------------------------------------- */
+const OfflineBanner = (() => {
+  let el = null;
+  function ensure() {
+    if (el) return;
+    el = document.createElement('div');
+    el.id = 'finplan-offline-banner';
+    el.style.cssText = [
+      'position:fixed;top:0;left:0;right:0;z-index:99999',
+      'background:#c0392b;color:#fff;text-align:center',
+      'padding:10px 16px;font-size:13px;font-weight:600',
+      'display:none;align-items:center;justify-content:center;gap:8px'
+    ].join(';');
+    el.textContent = '⚠️  Internet nahi hai — data locally saved hai, online hote hi sync hoga';
+    document.body.prepend(el);
+  }
+  function show() { ensure(); el.style.display = 'flex'; }
+  function hide() { if (el) el.style.display = 'none'; }
+  return { show, hide };
+})();
 function newUUID() {
   return (crypto.randomUUID ? crypto.randomUUID() :
     'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
@@ -477,7 +500,8 @@ const SyncEngine = (() => {
 
   /* ---- Push queued ops to Supabase, table-by-table, batched, with retry ---- */
   async function flush() {
-    if (!navigator.onLine) { setStatus('offline'); return; }
+    if (!navigator.onLine) { setStatus('offline'); OfflineBanner.show(); return; }
+    OfflineBanner.hide();
     if (!session) { setStatus('signed-out'); return; }
     let items = await SyncOutbox.load();
     if (items.length === 0) { setStatus('synced'); return; }
@@ -680,10 +704,16 @@ const SyncEngine = (() => {
     });
 
     window.addEventListener('online', async () => {
+      OfflineBanner.hide();
       if (session) { await flush(); await pullRemoteChanges(applyToDb, rerender); }
       else setStatus('signed-out');
     });
-    window.addEventListener('offline', () => setStatus('offline'));
+    window.addEventListener('offline', () => {
+      setStatus('offline');
+      OfflineBanner.show();
+    });
+
+    if (!navigator.onLine) OfflineBanner.show();
 
     if (session) {
       // Resume any changes still sitting in the outbox from a previous
@@ -691,7 +721,7 @@ const SyncEngine = (() => {
       // instead of waiting for the user's next edit to trigger a flush.
       const pending = await SyncOutbox.load();
       if (pending.length && navigator.onLine) await flush();
-      await pullRemoteChanges(applyToDb, rerender);
+      if (navigator.onLine) await pullRemoteChanges(applyToDb, rerender);
     }
 
     if (pullTimer) clearInterval(pullTimer);
