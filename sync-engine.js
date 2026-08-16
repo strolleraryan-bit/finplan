@@ -1,45 +1,37 @@
 /* ============================================================================
-   FINPLAN CLOUD SYNC ENGINE  (v1.0)
+   FINPLAN SYNC ENGINE  (v3.0 — FINAL, all fixes consolidated)
    ----------------------------------------------------------------------------
-   Modular, offline-first sync layer between the FinPlan app and Supabase.
-
-   RULES THIS FILE FOLLOWS:
-   - No other part of the app talks to Supabase. Ever. Only this file does.
-   - The app's in-memory `DB` object and `saveDB()` / `loadDB()` remain the
-     only things the rest of the app (2600+ lines of UI code) ever touches.
-   - IndexedDB is the primary local store. localStorage is only read once,
-     on first run, to migrate old data in — then it's left alone.
-   - Every function here is namespaced under one of five objects so the
-     module stays easy to reason about:
-       IDB          -> generic local key/value storage (IndexedDB wrapper)
-       IdMigration  -> one-time local ID normalization (legacy id -> UUID)
-       SupaService  -> the ONLY code that calls the Supabase client
-       SyncOutbox   -> the queue of local changes waiting to be uploaded
-       SyncEngine   -> the orchestrator: diffing, push, pull, retry, status
+   Design principles:
+   1. All record IDs MUST be UUIDs. Legacy non-UUID ids are auto-migrated once
+      on load, and any row builder silently skips a record that still isn't
+      a valid UUID (defensive — should never happen after migration).
+   2. Every save (saveDB -> notifyLocalChange) tries to push immediately if
+      online. If offline, the change stays queued in an outbox and an
+      offline banner is shown; nothing is lost.
+   3. Pull is always a FULL pull (fetch everything from Supabase and replace
+      local state) — never incremental. This guarantees no record is ever
+      missed due to clock/timestamp issues.
+   4. On sign-in: local outbox + local snapshot are wiped, then a full pull
+      happens. Server always wins on login.
+   5. On sign-out: all local data is wiped so no stale data leaks to the
+      next login (same device, different account, or re-login).
    ============================================================================ */
 
-/* ---------------------------------------------------------------------------
-   0. CONFIG — paste your Supabase project values here.
-   Where to find them: Supabase Dashboard -> your project -> left sidebar
-   "Project Settings" (gear icon) -> "API". Copy "Project URL" and the
-   "anon public" key (NOT the service_role key — that one must never be
-   used in a browser app).
---------------------------------------------------------------------------- */
 const SUPABASE_URL = 'https://cbauurxbzlbjfxudbshh.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNiYXV1cnhiemxiamZ4dWRic2hoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODY3MjE4NjgsImV4cCI6MjEwMjI5Nzg2OH0.IlR3wDhWpyil6vtNm2SCOeojc1bdVjX_c9NxI3j5p90';
 
+const IDB_STATE_KEY = 'app_state';
+const OUTBOX_KEY = 'outbox';
+const PULL_INTERVAL_MS = 20000; // 20s
+
 /* ---------------------------------------------------------------------------
-   1. IDB — tiny promise-based wrapper around IndexedDB.
-   One object store ("kv") used as a generic key/value store for:
-     'app_state'   -> the full FinPlan DB blob (replaces localStorage)
-     'outbox'      -> array of pending upload operations
-     'sync_meta'   -> { lastPulledAt: {table: iso_timestamp}, localClock: {...} }
+   1. IDB — tiny IndexedDB key/value wrapper (matches what index.html expects
+      as the global `IDB` — get/set)
 --------------------------------------------------------------------------- */
 const IDB = (() => {
   const DB_NAME = 'finplan_idb';
   const STORE = 'kv';
   let dbPromise = null;
-
   function open() {
     if (dbPromise) return dbPromise;
     dbPromise = new Promise((resolve, reject) => {
@@ -55,7 +47,7 @@ const IDB = (() => {
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE, 'readonly');
       const r = tx.objectStore(STORE).get(key);
-      r.onsuccess = () => resolve(r.result);
+      r.onsuccess = () => resolve(r.result ?? null);
       r.onerror = () => reject(r.error);
     });
   }
@@ -70,21 +62,54 @@ const IDB = (() => {
   }
   return { get, set };
 })();
+window.IDB = IDB;
 
 /* ---------------------------------------------------------------------------
-   2. ID MIGRATION — one-time, fully offline, no network required.
-   FinPlan's local `uid()` historically produced short non-UUID strings.
-   Supabase's primary keys are UUIDs. Rather than keep a permanent
-   translation table forever, we rewrite every existing local record's id
-   to a real UUID once, and fix every field anywhere in the app that
-   refers to that id. After this runs, local id === cloud id, always.
-   Guarded by DB.settings.uuidMigrated so it only ever runs once per device.
+   2. UUID helpers
 --------------------------------------------------------------------------- */
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 function isUUID(v) { return typeof v === 'string' && UUID_RE.test(v); }
+function newUUID() {
+  return (crypto && crypto.randomUUID) ? crypto.randomUUID() :
+    'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+      const r = Math.random() * 16 | 0;
+      return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+    });
+}
 
 /* ---------------------------------------------------------------------------
-   OFFLINE BANNER — shown when navigator.onLine is false
+   3. One-time legacy-ID migration (runs on every boot; idempotent because
+      it only touches ids that are still non-UUID)
+--------------------------------------------------------------------------- */
+function migrateLegacyIds(db) {
+  const map = {};
+  const collect = (arr) => (arr || []).forEach(r => {
+    if (r && r.id && !isUUID(r.id)) map[r.id] = newUUID();
+  });
+  collect(db.accounts); collect(db.categoriesIncome); collect(db.categoriesExpense);
+  collect(db.income); collect(db.expense); collect(db.investments);
+
+  if (Object.keys(map).length === 0) return db; // nothing to do
+
+  const remap = (arr) => (arr || []).forEach(r => { if (r && r.id && map[r.id]) r.id = map[r.id]; });
+  remap(db.accounts); remap(db.categoriesIncome); remap(db.categoriesExpense);
+  remap(db.income); remap(db.expense); remap(db.investments);
+
+  [...(db.income || []), ...(db.expense || [])].forEach(t => {
+    if (t.accountId && map[t.accountId]) t.accountId = map[t.accountId];
+    if (t.linkedInvestmentId && map[t.linkedInvestmentId]) t.linkedInvestmentId = map[t.linkedInvestmentId];
+  });
+  (db.investments || []).forEach(inv => {
+    if (inv.linkedExpenseId && map[inv.linkedExpenseId]) inv.linkedExpenseId = map[inv.linkedExpenseId];
+  });
+  if (db.settings && db.settings.defaultAccount && map[db.settings.defaultAccount]) {
+    db.settings.defaultAccount = map[db.settings.defaultAccount];
+  }
+  return db;
+}
+
+/* ---------------------------------------------------------------------------
+   4. Offline banner
 --------------------------------------------------------------------------- */
 const OfflineBanner = (() => {
   let el = null;
@@ -93,175 +118,93 @@ const OfflineBanner = (() => {
     el = document.createElement('div');
     el.id = 'finplan-offline-banner';
     el.style.cssText = [
-      'position:fixed;top:0;left:0;right:0;z-index:99999',
-      'background:#c0392b;color:#fff;text-align:center',
-      'padding:10px 16px;font-size:13px;font-weight:600',
-      'display:none;align-items:center;justify-content:center;gap:8px'
+      'position:fixed', 'top:0', 'left:0', 'right:0', 'z-index:99999',
+      'background:#c0392b', 'color:#fff', 'text-align:center',
+      'padding:10px 16px', 'font-size:13px', 'font-weight:600',
+      'display:none', 'align-items:center', 'justify-content:center', 'gap:8px'
     ].join(';');
-    el.textContent = '⚠️  Internet nahi hai — data locally saved hai, online hote hi sync hoga';
+    el.textContent = '⚠️  Internet nahi hai — data locally save ho raha hai, connection aate hi sync ho jayega';
     document.body.prepend(el);
   }
   function show() { ensure(); el.style.display = 'flex'; }
   function hide() { if (el) el.style.display = 'none'; }
   return { show, hide };
 })();
-function newUUID() {
-  return (crypto.randomUUID ? crypto.randomUUID() :
-    'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
-      const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
-      return v.toString(16);
-    }));
-}
-
-const IdMigration = {
-  run(db) {
-    if (db.settings && db.settings.uuidMigrated) return db;
-    const map = {};
-    const collect = (arr) => (arr || []).forEach(r => {
-      if (r && r.id && !isUUID(r.id)) map[r.id] = newUUID();
-    });
-    collect(db.accounts); collect(db.categoriesIncome); collect(db.categoriesExpense);
-    collect(db.income); collect(db.expense); collect(db.investments);
-
-    const remap = (arr) => (arr || []).forEach(r => { if (r && map[r.id]) r.id = map[r.id]; });
-    remap(db.accounts); remap(db.categoriesIncome); remap(db.categoriesExpense);
-    remap(db.income); remap(db.expense); remap(db.investments);
-
-    [...(db.income || []), ...(db.expense || [])].forEach(t => {
-      if (t.accountId && map[t.accountId]) t.accountId = map[t.accountId];
-      if (t.linkedInvestmentId && map[t.linkedInvestmentId]) t.linkedInvestmentId = map[t.linkedInvestmentId];
-    });
-    (db.investments || []).forEach(inv => {
-      if (inv.linkedExpenseId && map[inv.linkedExpenseId]) inv.linkedExpenseId = map[inv.linkedExpenseId];
-    });
-    if (db.settings && db.settings.defaultAccount && map[db.settings.defaultAccount]) {
-      db.settings.defaultAccount = map[db.settings.defaultAccount];
-    }
-    if (db.settings) db.settings.uuidMigrated = true;
-    return db;
-  }
-};
 
 /* ---------------------------------------------------------------------------
-   3. SUPABASE SERVICE — the only module that ever calls Supabase.
-   Requires the Supabase JS SDK to be loaded on the page (script tag added
-   to index.html). If it hasn't loaded (e.g. first offline install before
-   any internet connection ever occurred), every method here fails soft.
+   5. Supabase service layer
 --------------------------------------------------------------------------- */
 const SupaService = (() => {
-  let client = null;
+  let _client = null;
   function getClient() {
-    if (client) return client;
-    if (typeof window === 'undefined' || !window.supabase) return null;
-    client = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-      auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true }
-    });
-    return client;
+    if (_client) return _client;
+    if (typeof supabase === 'undefined') return null;
+    _client = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+    return _client;
   }
-
   async function getSession() {
     const c = getClient(); if (!c) return null;
     const { data } = await c.auth.getSession();
-    return data.session;
+    return data && data.session ? data.session : null;
   }
   function onAuthStateChange(cb) {
     const c = getClient(); if (!c) return;
-    c.auth.onAuthStateChange((event, session) => cb(event, session));
-  }
-  async function signInWithMagicLink(email) {
-    const c = getClient(); if (!c) throw new Error('Supabase not configured');
-    return c.auth.signInWithOtp({ email, options: { emailRedirectTo: window.location.origin + window.location.pathname } });
-  }
-  // Email/password signup. If "Confirm email" is enabled in Supabase (default),
-  // this automatically sends a verification email — nothing extra to build.
-  async function signUpWithPassword(email, password) {
-    const c = getClient(); if (!c) throw new Error('Supabase not configured');
-    const { data, error } = await c.auth.signUp({
-      email, password,
-      options: { emailRedirectTo: window.location.origin + window.location.pathname }
-    });
-    if (error) throw error;
-    return data;
-  }
-  async function signInWithPassword(email, password) {
-    const c = getClient(); if (!c) throw new Error('Supabase not configured');
-    const { data, error } = await c.auth.signInWithPassword({ email, password });
-    if (error) throw error;
-    return data;
+    c.auth.onAuthStateChange(cb);
   }
   async function signInWithGoogle() {
-    const c = getClient(); if (!c) throw new Error('Supabase not configured');
+    const c = getClient(); if (!c) throw new Error('offline');
     const { error } = await c.auth.signInWithOAuth({
       provider: 'google',
-      options: { redirectTo: window.location.origin + window.location.pathname }
-    });
-    if (error) throw error;
-    // Browser navigates away to Google here; nothing more to do on this page.
-  }
-  async function resetPasswordForEmail(email) {
-    const c = getClient(); if (!c) throw new Error('Supabase not configured');
-    const { error } = await c.auth.resetPasswordForEmail(email, {
-      redirectTo: window.location.origin + window.location.pathname
+      options: { redirectTo: window.location.href }
     });
     if (error) throw error;
   }
-  async function updatePassword(newPassword) {
-    const c = getClient(); if (!c) throw new Error('Supabase not configured');
-    const { error } = await c.auth.updateUser({ password: newPassword });
+  async function signInPassword(email, password) {
+    const c = getClient(); if (!c) throw new Error('offline');
+    const { error } = await c.auth.signInWithPassword({ email, password });
+    if (error) throw error;
+  }
+  async function signUp(email, password) {
+    const c = getClient(); if (!c) throw new Error('offline');
+    const { error } = await c.auth.signUp({ email, password });
+    if (error) throw error;
+  }
+  async function resetPassword(email) {
+    const c = getClient(); if (!c) throw new Error('offline');
+    const { error } = await c.auth.resetPasswordForEmail(email, { redirectTo: window.location.href });
+    if (error) throw error;
+  }
+  async function updatePassword(pw) {
+    const c = getClient(); if (!c) throw new Error('offline');
+    const { error } = await c.auth.updateUser({ password: pw });
     if (error) throw error;
   }
   async function signOut() {
     const c = getClient(); if (!c) return;
-    try { await c.auth.signOut(); } catch (e) { /* session already gone, ignore 403 */ }
+    try { await c.auth.signOut(); } catch (e) { /* session already invalid — ignore 403 */ }
   }
-  async function clearLocal() {
-    await IDB.set('app_state', null);
-    await IDB.set('outbox', []);
-    await IDB.set('sync_meta', { lastPulledAt: {} });
-  }
-
-  async function upsert(table, row) {
-    const c = getClient(); if (!c) throw new Error('offline');
-    const { error } = await c.from(table).upsert(row, { onConflict: 'id' });
-    if (error) throw error;
-  }
-  // Batched upsert — used by flush() so a bulk sync (e.g. years of existing
-  // data on first sign-in) is a handful of requests instead of one per row.
-  async function upsertBatch(table, rows) {
+  async function upsert(table, rows) {
+    if (!rows.length) return;
     const c = getClient(); if (!c) throw new Error('offline');
     const { error } = await c.from(table).upsert(rows, { onConflict: 'id' });
     if (error) throw error;
   }
   async function upsertSettings(row) {
     const c = getClient(); if (!c) throw new Error('offline');
-    const { error } = await c.from('settings').upsert(row, { onConflict: 'user_id' });
+    const { error } = await c.from('settings').upsert([row], { onConflict: 'user_id' });
     if (error) throw error;
   }
-  async function softDelete(table, id) {
+  // Always fetches ALL rows for the table (full pull, no incremental filter)
+  async function fetchAll(table, userId) {
     const c = getClient(); if (!c) throw new Error('offline');
-    const { error } = await c.from(table)
-      .update({ is_deleted: true, deleted_at: new Date().toISOString() })
-      .eq('id', id);
-    if (error) throw error;
-  }
-  async function softDeleteBatch(table, ids) {
-    const c = getClient(); if (!c) throw new Error('offline');
-    const { error } = await c.from(table)
-      .update({ is_deleted: true, deleted_at: new Date().toISOString() })
-      .in('id', ids);
-    if (error) throw error;
-  }
-  // Paginated: a long offline stretch with heavy multi-device edits could mean
-  // thousands of changed rows since the last pull. Fetch in pages rather than
-  // one unbounded request.
-  async function fetchChangedSince(table, userId, sinceIso) {
-    const c = getClient(); if (!c) throw new Error('offline');
-    const PAGE = 500;
+    const PAGE = 1000;
     let all = [], from = 0;
     while (true) {
-      let q = c.from(table).select('*').eq('user_id', userId).order('updated_at', { ascending: true });
-      q = sinceIso ? q.gt('updated_at', sinceIso) : q;
-      const { data, error } = await q.range(from, from + PAGE - 1);
+      const { data, error } = await c.from(table)
+        .select('*')
+        .eq('user_id', userId)
+        .eq('is_deleted', false)
+        .range(from, from + PAGE - 1);
       if (error) throw error;
       all = all.concat(data || []);
       if (!data || data.length < PAGE) break;
@@ -275,499 +218,351 @@ const SupaService = (() => {
     if (error) throw error;
     return data;
   }
-
   return {
-    getClient, getSession, onAuthStateChange, signInWithMagicLink, signOut,
-    signUpWithPassword, signInWithPassword, signInWithGoogle,
-    resetPasswordForEmail, updatePassword,
-    upsert, upsertBatch, upsertSettings, softDelete, softDeleteBatch,
-    fetchChangedSince, fetchSettings
+    getClient, getSession, onAuthStateChange,
+    signInWithGoogle, signInPassword, signUp, resetPassword, updatePassword, signOut,
+    upsert, upsertSettings, fetchAll, fetchSettings
   };
 })();
 
 /* ---------------------------------------------------------------------------
-   4. SYNC OUTBOX — persisted queue of pending uploads.
-   Each item: { table, op: 'upsert'|'delete', id, row, attempts, addedAt }
-   Order matters for foreign keys, so SyncEngine always flushes in table
-   priority order: accounts -> categories -> investments -> transactions
-   -> settings. This is enforced in SyncEngine.flush(), not here.
+   6. Row builders (app object -> Supabase row). Every builder returns null
+      if the record's id (or a required FK) is not a valid UUID, so it is
+      silently skipped rather than sent and rejected by Postgres.
 --------------------------------------------------------------------------- */
-const SyncOutbox = {
-  async load() { return (await IDB.get('outbox')) || []; },
-  async save(items) { await IDB.set('outbox', items); },
+function toAccountRow(a, uid) {
+  if (!isUUID(a.id)) return null;
+  return {
+    id: a.id, user_id: uid, name: a.name || '', type: a.type || 'bank',
+    icon: a.icon || null, color: a.color || null,
+    opening_balance: a.openingBalance || 0, is_deleted: false, deleted_at: null
+  };
+}
+function toCategoryRow(c, uid) {
+  if (!isUUID(c.id)) return null;
+  return {
+    id: c.id, user_id: uid, kind: c.kind, name: c.name || '',
+    icon: c.icon || null, color: c.color || null, locked: !!c.locked,
+    is_deleted: false, deleted_at: null
+  };
+}
+function toInvestmentRow(inv, uid) {
+  if (!isUUID(inv.id)) return null;
+  return {
+    id: inv.id, user_id: uid, name: inv.name || '', category: inv.category || '',
+    purchase_date: inv.purchaseDate || null, purchase_price: inv.purchasePrice ?? null,
+    quantity: inv.quantity ?? null, invested_amount: inv.investedAmount || 0,
+    current_value: inv.currentValue || 0, notes: inv.notes || null,
+    history: inv.history || [],
+    linked_expense_id: (inv.linkedExpenseId && isUUID(inv.linkedExpenseId)) ? inv.linkedExpenseId : null,
+    txn_id: inv.txnId || null, closed: !!inv.closed,
+    is_deleted: false, deleted_at: null
+  };
+}
+function toTransactionRow(t, uid, db) {
+  if (!isUUID(t.id)) return null;
+  let catId = null;
+  const cats = t.type === 'income' ? (db.categoriesIncome || []) : (db.categoriesExpense || []);
+  const found = cats.find(c => c.name === t.category);
+  if (found && isUUID(found.id)) catId = found.id;
+  return {
+    id: t.id, user_id: uid, type: t.type, date: t.date, amount: t.amount,
+    account_id: (t.accountId && isUUID(t.accountId)) ? t.accountId : null,
+    category_id: catId,
+    notes: t.notes || null, tags: t.tags || [], location: t.location || null,
+    attachment: t.attachment || null, credit: t.credit || null, loan: t.loan || null,
+    reminder: t.reminder || null,
+    linked_investment_id: (t.linkedInvestmentId && isUUID(t.linkedInvestmentId)) ? t.linkedInvestmentId : null,
+    realized_pl: t.realizedPL ?? null, txn_id: t.txnId || null,
+    is_deleted: false, deleted_at: null
+  };
+}
+function toSettingsRow(s, uid) {
+  return {
+    user_id: uid, currency: s.currency || 'INR', theme: s.theme || 'dark',
+    accent: s.accent || null, date_format: s.dateFormat || 'DD/MM/YYYY',
+    default_account_id: (s.defaultAccount && isUUID(s.defaultAccount)) ? s.defaultAccount : null,
+    notif_enabled: !!s.notifEnabled, notified_log: s.notifiedLog || {}
+  };
+}
+
+/* ---------------------------------------------------------------------------
+   7. Reverse mappers (Supabase row -> app object), used when pulling
+--------------------------------------------------------------------------- */
+function fromAccountRow(a) {
+  return { id: a.id, name: a.name, type: a.type, icon: a.icon, color: a.color, openingBalance: Number(a.opening_balance) || 0 };
+}
+function fromCategoryRow(c) {
+  return { id: c.id, name: c.name, icon: c.icon, color: c.color, locked: !!c.locked };
+}
+function fromInvestmentRow(i) {
+  return {
+    id: i.id, name: i.name, category: i.category, purchaseDate: i.purchase_date,
+    purchasePrice: i.purchase_price, quantity: i.quantity,
+    investedAmount: Number(i.invested_amount) || 0, currentValue: Number(i.current_value) || 0,
+    notes: i.notes, history: i.history || [], linkedExpenseId: i.linked_expense_id,
+    txnId: i.txn_id, closed: !!i.closed
+  };
+}
+function fromTransactionRow(t, accountsById, categoriesById) {
+  const acc = accountsById[t.account_id];
+  const cat = categoriesById[t.category_id];
+  return {
+    id: t.id, date: t.date, amount: Number(t.amount) || 0,
+    accountId: t.account_id || null, accountName: acc ? acc.name : '',
+    category: cat ? cat.name : '', categoryId: t.category_id || null,
+    notes: t.notes, tags: t.tags || [], location: t.location,
+    attachment: t.attachment, credit: t.credit, loan: t.loan,
+    reminder: t.reminder, linkedInvestmentId: t.linked_investment_id,
+    realizedPL: t.realized_pl, txnId: t.txn_id
+  };
+}
+
+/* ---------------------------------------------------------------------------
+   8. Outbox — persisted queue of pending pushes (used only while offline;
+      the moment we're back online it's flushed and cleared)
+--------------------------------------------------------------------------- */
+const Outbox = {
+  async load() { return (await IDB.get(OUTBOX_KEY)) || []; },
+  async save(items) { await IDB.set(OUTBOX_KEY, items); },
+  async clear() { await IDB.set(OUTBOX_KEY, []); },
   async push(item) {
-    const items = await this.load();
-    // De-dupe: if this exact record already has a pending op, replace it
-    // (the newest local state wins — no point uploading stale intermediate edits).
-    const idx = items.findIndex(i => i.table === item.table && i.id === item.id);
-    if (idx > -1) items[idx] = { ...item, attempts: items[idx].attempts };
-    else items.push({ ...item, attempts: 0, addedAt: Date.now() });
-    await this.save(items);
-  },
-  async remove(table, id) {
-    const items = await this.load();
-    await this.save(items.filter(i => !(i.table === table && i.id === id)));
-  },
-  async bumpAttempts(table, id) {
-    const items = await this.load();
-    const it = items.find(i => i.table === table && i.id === id);
-    if (it) it.attempts = (it.attempts || 0) + 1;
-    await this.save(items);
+    const items = await Outbox.load();
+    items.push(item);
+    await Outbox.save(items);
   }
 };
 
 /* ---------------------------------------------------------------------------
-   5. SYNC ENGINE — the orchestrator.
-   Public surface used by the app's UI layer (index.html):
-     SyncEngine.init()                 -> call once at boot, after DB is loaded
-     SyncEngine.notifyLocalChange(db)  -> call from inside saveDB() every time
-     SyncEngine.signIn(email)          -> magic-link sign in
-     SyncEngine.signUp(email,pw)       -> email/password account creation (sends verification email)
-     SyncEngine.signInPassword(email,pw)
-     SyncEngine.signInGoogle()         -> redirects to Google, comes back signed in
-     SyncEngine.resetPassword(email)   -> sends password-reset email
-     SyncEngine.updatePassword(pw)     -> call while isPasswordRecovery() is true
-     SyncEngine.isPasswordRecovery()   -> true right after a reset-password email link is opened
-     SyncEngine.clearRecoveryMode()    -> call after updatePassword() succeeds
-     SyncEngine.signOut()
-     SyncEngine.getStatus()            -> 'signed-out'|'offline'|'syncing'|'synced'|'error'
-     SyncEngine.onStatusChange(cb)     -> subscribe a UI callback (status pill)
+   9. SyncEngine — main orchestrator, exposes the exact API index.html uses
 --------------------------------------------------------------------------- */
-const TABLE_ORDER = ['accounts', 'categories', 'investments', 'transactions'];
-
 const SyncEngine = (() => {
-  let status = 'signed-out';
+  let uid = null;
   let session = null;
-  let recoveryMode = false;  // true while the user is mid password-reset flow
-  let lastSnapshot = null;   // last known collections snapshot, for diffing
-  let flushTimer = null;
+  let status = 'signed-out'; // 'signed-out' | 'offline' | 'syncing' | 'synced' | 'error'
+  let statusListeners = [];
+  let recoveryMode = false;
+  let applyToDbRef = null;
+  let rerenderRef = null;
   let pullTimer = null;
-  let listeners = [];
-  let started = false;
+  let pushInFlight = false;
 
   function setStatus(s) {
     status = s;
-    listeners.forEach(cb => { try { cb(s); } catch (e) {} });
-  }
-  function onStatusChange(cb) { listeners.push(cb); cb(status); }
-  function getStatus() { return status; }
-
-  /* ---- Build a flat, diff-friendly snapshot of the current DB ---- */
-  function snapshotOf(db) {
-    return {
-      accounts: db.accounts || [],
-      categories: [
-        ...(db.categoriesIncome || []).map(c => ({ ...c, kind: 'income' })),
-        ...(db.categoriesExpense || []).map(c => ({ ...c, kind: 'expense' }))
-      ],
-      investments: db.investments || [],
-      transactions: [
-        ...(db.income || []).map(t => ({ ...t, type: 'income' })),
-        ...(db.expense || []).map(t => ({ ...t, type: 'expense' }))
-      ],
-      settings: db.settings || {}
-    };
+    statusListeners.forEach(fn => { try { fn(s); } catch (e) {} });
   }
 
-  /* ---- Row builders: local record shape -> Supabase row shape ---- */
-  function rowUserId() { return session && session.user && session.user.id; }
-  // Local transactions store the category as a NAME string, but the remote
-  // schema has a proper category_id FK. Categories always sync before
-  // transactions (TABLE_ORDER), and ids are unified UUIDs post-migration, so
-  // we resolve the real id here instead of leaving the column empty.
-  function resolveCategoryId(db, type, categoryName) {
-    const list = type === 'income' ? db.categoriesIncome : db.categoriesExpense;
-    const match = (list || []).find(c => c.name === categoryName);
-    return match ? match.id : null;
-  }
-  function resolveCategoryName(db, kind, categoryId) {
-    const list = kind === 'income' ? db.categoriesIncome : db.categoriesExpense;
-    const match = (list || []).find(c => c.id === categoryId);
-    return match ? match.name : null;
-  }
-
-  // Every fresh device seeds its own local default categories (Salary, Food,
-  // etc.) with device-generated ids before it has ever synced. If this isn't
-  // the FIRST device to ever sync this account, those same-named categories
-  // already exist remotely under different ids — pushing them again would
-  // violate the database's one-name-per-kind-per-user rule and fail forever.
-  // Fix: on first sign-in, pull the remote category list and, for any local
-  // category whose (kind, name) already exists remotely, adopt the remote id
-  // in place. Nothing else needs updating — transactions reference categories
-  // by NAME locally, not by id, so this rewrite is fully self-contained.
-  async function reconcileCategoriesOnFirstSignIn(db) {
-    let remoteCats;
-    try { remoteCats = await SupaService.fetchChangedSince('categories', session.user.id, null); }
-    catch (e) { return; } // offline/error — proceed without reconciling; worst case, resolve manually later
-    if (!remoteCats || !remoteCats.length) return;
-    const byKindName = new Map(
-      remoteCats.filter(r => !r.is_deleted).map(r => [r.kind + '::' + r.name, r.id])
-    );
-    const reconcile = (arr, kind) => (arr || []).forEach(c => {
-      const remoteId = byKindName.get(kind + '::' + c.name);
-      if (remoteId && remoteId !== c.id) c.id = remoteId;
-    });
-    reconcile(db.categoriesIncome, 'income');
-    reconcile(db.categoriesExpense, 'expense');
-  }
-
-  function toAccountRow(a) {
-    if (!isUUID(a.id)) return null; // skip legacy non-UUID ids
-    return {
-      id: a.id, user_id: rowUserId(), name: a.name, type: a.type, icon: a.icon,
-      color: a.color, opening_balance: a.openingBalance || 0
-    };
-  }
-  function toCategoryRow(c) {
-    if (!isUUID(c.id)) return null; // skip legacy non-UUID ids
-    return {
-      id: c.id, user_id: rowUserId(), kind: c.kind, name: c.name,
-      icon: c.icon, color: c.color, locked: !!c.locked
-    };
-  }
-  function toInvestmentRow(inv) {
-    if (!isUUID(inv.id)) return null; // skip legacy non-UUID ids
-    return {
-      id: inv.id, user_id: rowUserId(), name: inv.name, category: inv.category,
-      purchase_date: inv.purchaseDate, purchase_price: inv.purchasePrice || null,
-      quantity: inv.quantity || null, invested_amount: inv.investedAmount || 0,
-      current_value: inv.currentValue || 0, notes: inv.notes || null,
-      history: inv.history || [],
-      linked_expense_id: (inv.linkedExpenseId && isUUID(inv.linkedExpenseId)) ? inv.linkedExpenseId : null,
-      txn_id: inv.txnId || null, closed: !!inv.closed
-    };
-  }
-  function toTransactionRow(t, db) {
-    if (!isUUID(t.id)) return null; // skip legacy non-UUID ids
-    return {
-      id: t.id, user_id: rowUserId(), type: t.type, date: t.date, amount: t.amount,
-      account_id: t.accountId, category_id: resolveCategoryId(db, t.type, t.category),
-      notes: t.notes || null,
-      tags: t.tags || [], location: t.location || null, attachment: t.attachment || null,
-      credit: t.credit || null, loan: t.loan || null, reminder: t.reminder || null,
-      linked_investment_id: t.linkedInvestmentId || null, realized_pl: t.realizedPL ?? null,
-      txn_id: t.txnId || null
-    };
-  }
-  function toSettingsRow(s) {
-    return {
-      user_id: rowUserId(), currency: s.currency, theme: s.theme, accent: s.accent,
-      date_format: s.dateFormat, default_account_id: s.defaultAccount || null,
-      notif_enabled: !!s.notifEnabled, notified_log: s.notifiedLog || {}
-    };
-  }
-
-  /* ---- Diff current DB against last snapshot, queue outbox ops ---- */
-  async function notifyLocalChange(db) {
-    if (!started) return; // engine not initialized yet (e.g. very first loadDB call)
-    const snap = snapshotOf(db);
-    const prev = lastSnapshot;
-    lastSnapshot = snap;
-    if (!prev) return; // nothing to diff against on the very first pass
-
-    for (const table of TABLE_ORDER) {
-      const prevArr = prev[table] || [];
-      const newArr = snap[table] || [];
-      const prevMap = new Map(prevArr.map(r => [r.id, r]));
-      const newMap = new Map(newArr.map(r => [r.id, r]));
-
-      for (const [id, rec] of newMap) {
-        const old = prevMap.get(id);
-        if (!old || JSON.stringify(old) !== JSON.stringify(rec)) {
-          const row = table === 'accounts' ? toAccountRow(rec)
-            : table === 'categories' ? toCategoryRow(rec)
-            : table === 'investments' ? toInvestmentRow(rec)
-            : toTransactionRow(rec, db);
-          if (row === null || row === undefined) continue; // skip unmappable rows (e.g. legacy non-UUID ids)
-          await SyncOutbox.push({ table, op: 'upsert', id, row });
-        }
-      }
-      for (const [id] of prevMap) {
-        if (!newMap.has(id)) await SyncOutbox.push({ table, op: 'delete', id, row: null });
-      }
-    }
-    // settings is a singleton row, diffed separately
-    if (!prev.settings || JSON.stringify(prev.settings) !== JSON.stringify(snap.settings)) {
-      await SyncOutbox.push({ table: 'settings', op: 'upsert', id: 'singleton', row: toSettingsRow(snap.settings) });
-    }
-
-    scheduleFlush();
-  }
-
-  function scheduleFlush() {
-    if (flushTimer) clearTimeout(flushTimer);
-    flushTimer = setTimeout(flush, 1500); // debounce rapid edits
-  }
-
-  const MAX_ATTEMPTS = 10; // stop retrying a permanently-failing item (e.g. a
-  // duplicate-name constraint violation) after this many tries, instead of
-  // hammering the API forever every retry cycle.
-
-  /* ---- Push queued ops to Supabase, table-by-table, batched, with retry ---- */
-  async function flush() {
-    if (!navigator.onLine) { setStatus('offline'); OfflineBanner.show(); return; }
+  /* ---- PUSH: build rows for every table from current app DB and upsert ---- */
+  async function pushAll(db) {
+    if (!uid) return;
+    if (!navigator.onLine) { OfflineBanner.show(); setStatus('offline'); return; }
+    if (pushInFlight) return;
+    pushInFlight = true;
     OfflineBanner.hide();
-    if (!session) { setStatus('signed-out'); return; }
-    let items = await SyncOutbox.load();
-    if (items.length === 0) { setStatus('synced'); return; }
     setStatus('syncing');
-
-    // Drop anything that's failed too many times in a row so it doesn't
-    // retry forever — surface it as an error instead of silently looping.
-    const dead = items.filter(i => (i.attempts || 0) >= MAX_ATTEMPTS);
-    if (dead.length) {
-      items = items.filter(i => (i.attempts || 0) < MAX_ATTEMPTS);
-      await SyncOutbox.save(items.concat(dead)); // keep them queued but excluded from this pass
-    }
-
-    const order = [...TABLE_ORDER, 'settings'];
-    let anyFailed = dead.length > 0;
-    const uid = session.user.id;
-    // Always stamp the CURRENT signed-in user's id onto every row right
-    // before upload, overriding whatever was baked in when the item was
-    // originally queued. This matters because items can be queued before
-    // sign-in ever happens (offline-first: the app tracks changes from the
-    // very first launch) — those rows had no valid user_id at queue time,
-    // and mixing them into a batch with correctly-attributed rows made the
-    // whole batch fail (Supabase's bulk upsert requires every row in a
-    // batch to share the same set of fields). Restamping here guarantees
-    // every uploaded row is correctly attributed regardless of when it was
-    // originally created.
-    const stamp = (row) => ({ ...row, user_id: uid });
-    for (const table of order) {
-      const batch = items.filter(i => i.table === table);
-      if (!batch.length) continue;
-
-      if (table === 'settings') {
-        for (const item of batch) {
-          try { await SupaService.upsertSettings(stamp(item.row)); await SyncOutbox.remove(table, item.id); }
-          catch (e) { anyFailed = true; await SyncOutbox.bumpAttempts(table, item.id); }
-        }
-        continue;
-      }
-
-      // Batch upserts and batch deletes each into a single request per table.
-      const upserts = batch.filter(i => i.op === 'upsert');
-      const deletes = batch.filter(i => i.op === 'delete');
-      if (upserts.length) {
-        try {
-          await SupaService.upsertBatch(table, upserts.map(i => stamp(i.row)));
-          for (const i of upserts) await SyncOutbox.remove(table, i.id);
-        } catch (e) {
-          anyFailed = true;
-          for (const i of upserts) await SyncOutbox.bumpAttempts(table, i.id);
-          // Common transient case: an investment references a transaction (or
-          // vice versa) that hasn't uploaded yet in this same cycle. Leaving
-          // it queued means the next flush cycle resolves it once the sibling
-          // record has synced.
-        }
-      }
-      if (deletes.length) {
-        try {
-          await SupaService.softDeleteBatch(table, deletes.map(i => i.id));
-          for (const i of deletes) await SyncOutbox.remove(table, i.id);
-        } catch (e) {
-          anyFailed = true;
-          for (const i of deletes) await SyncOutbox.bumpAttempts(table, i.id);
-        }
-      }
-    }
-    setStatus(anyFailed ? (dead.length ? 'error' : 'syncing') : 'synced');
-    if (anyFailed && !dead.length) flushTimer = setTimeout(flush, 8000); // backoff retry
-  }
-
-  /* ---- Pull remote changes down and merge into local DB ---- */
-  async function pullRemoteChanges(applyToDb, rerender) {
-    if (!navigator.onLine || !session) return;
-    const uid = session.user.id;
-    const meta = (await IDB.get('sync_meta')) || { lastPulledAt: {} };
-    let changed = false;
-
     try {
-      // Records with a pending local edit still in the outbox must not be
-      // clobbered by an incoming (older, by definition) remote version —
-      // our local edit is already queued to overwrite it. Skip merging
-      // those specific records this cycle; they'll reconcile once our own
-      // push lands and the next pull sees the newer server state.
-      const pendingIds = new Set((await SyncOutbox.load()).map(i => i.table + '::' + i.id));
+      const accRows = (db.accounts || []).map(a => toAccountRow(a, uid)).filter(Boolean);
+      await SupaService.upsert('accounts', accRows);
 
-      for (const table of TABLE_ORDER) {
-        const since = meta.lastPulledAt[table];
-        const rows = await SupaService.fetchChangedSince(table, uid, since);
-        if (rows.length) { mergeRemoteRows(table, rows, applyToDb, pendingIds); changed = true; }
-        meta.lastPulledAt[table] = new Date().toISOString();
-      }
-      const settingsRow = await SupaService.fetchSettings(uid);
-      if (settingsRow && !pendingIds.has('settings::singleton')) {
-        mergeRemoteSettings(settingsRow, applyToDb); changed = true;
-      }
-      await IDB.set('sync_meta', meta);
-      if (changed) { lastSnapshot = snapshotOf(applyToDb.get()); rerender && rerender(); }
+      const catRows = [
+        ...(db.categoriesIncome || []).map(c => toCategoryRow({ ...c, kind: 'income' }, uid)),
+        ...(db.categoriesExpense || []).map(c => toCategoryRow({ ...c, kind: 'expense' }, uid))
+      ].filter(Boolean);
+      await SupaService.upsert('categories', catRows);
+
+      const invRows = (db.investments || []).map(i => toInvestmentRow(i, uid)).filter(Boolean);
+      await SupaService.upsert('investments', invRows);
+
+      const txnRows = [
+        ...(db.income || []).map(t => toTransactionRow({ ...t, type: 'income' }, uid, db)),
+        ...(db.expense || []).map(t => toTransactionRow({ ...t, type: 'expense' }, uid, db))
+      ].filter(Boolean);
+      await SupaService.upsert('transactions', txnRows);
+
+      if (db.settings) await SupaService.upsertSettings(toSettingsRow(db.settings, uid));
+
+      await Outbox.clear();
       setStatus('synced');
     } catch (e) {
+      console.error('[SyncEngine] push failed:', e);
+      // Keep a snapshot in outbox so we retry once back online / next save
+      await Outbox.save([{ ts: Date.now() }]);
+      setStatus('error');
+    } finally {
+      pushInFlight = false;
+    }
+  }
+
+  /* ---- PULL: fetch everything from Supabase and replace local state ---- */
+  async function pullAll() {
+    if (!uid || !applyToDbRef) return;
+    if (!navigator.onLine) { setStatus('offline'); OfflineBanner.show(); return; }
+    setStatus('syncing');
+    try {
+      const [accounts, categories, investments, transactions, settingsRow] = await Promise.all([
+        SupaService.fetchAll('accounts', uid),
+        SupaService.fetchAll('categories', uid),
+        SupaService.fetchAll('investments', uid),
+        SupaService.fetchAll('transactions', uid),
+        SupaService.fetchSettings(uid)
+      ]);
+
+      const db = applyToDbRef.get();
+
+      db.accounts = accounts.map(fromAccountRow);
+
+      const accountsById = {};
+      db.accounts.forEach(a => { accountsById[a.id] = a; });
+
+      db.categoriesIncome = categories.filter(c => c.kind === 'income').map(fromCategoryRow);
+      db.categoriesExpense = categories.filter(c => c.kind === 'expense').map(fromCategoryRow);
+
+      const categoriesById = {};
+      categories.forEach(c => { categoriesById[c.id] = c; });
+
+      db.investments = investments.map(fromInvestmentRow);
+
+      const incomeRows = transactions.filter(t => t.type === 'income');
+      const expenseRows = transactions.filter(t => t.type === 'expense');
+      db.income = incomeRows.map(t => fromTransactionRow(t, accountsById, categoriesById));
+      db.expense = expenseRows.map(t => fromTransactionRow(t, accountsById, categoriesById));
+
+      if (settingsRow) {
+        db.settings = {
+          ...db.settings,
+          currency: settingsRow.currency || db.settings.currency,
+          theme: settingsRow.theme || db.settings.theme,
+          accent: settingsRow.accent,
+          dateFormat: settingsRow.date_format || db.settings.dateFormat,
+          defaultAccount: settingsRow.default_account_id,
+          notifEnabled: !!settingsRow.notif_enabled,
+          notifiedLog: settingsRow.notified_log || {}
+        };
+      }
+
+      applyToDbRef.set(db);
+      await IDB.set(IDB_STATE_KEY, db);
+      setStatus('synced');
+      OfflineBanner.hide();
+      rerenderRef && rerenderRef();
+    } catch (e) {
+      console.error('[SyncEngine] pull failed:', e);
       setStatus('error');
     }
   }
 
-  function mergeRemoteRows(table, rows, applyToDb, pendingIds) {
-    const db = applyToDb.get();
-    rows.forEach(r => {
-      if (pendingIds && pendingIds.has(table + '::' + r.id)) return; // local edit pending, don't overwrite
-      if (table === 'accounts') mergeInto(db.accounts, fromAccountRow(r), r);
-      if (table === 'investments') mergeInto(db.investments, fromInvestmentRow(r), r);
-      if (table === 'transactions') {
-        const arr = r.type === 'income' ? db.income : db.expense;
-        mergeInto(arr, fromTransactionRow(r, db), r);
-      }
-      if (table === 'categories') {
-        const arr = r.kind === 'income' ? db.categoriesIncome : db.categoriesExpense;
-        mergeInto(arr, fromCategoryRow(r), r);
-      }
-    });
-    applyToDb.set(db);
-  }
-  function mergeInto(arr, localShapedRecord, remoteRow) {
-    const idx = arr.findIndex(x => x.id === remoteRow.id);
-    if (remoteRow.is_deleted) { if (idx > -1) arr.splice(idx, 1); return; }
-    if (idx > -1) arr[idx] = localShapedRecord; else arr.push(localShapedRecord);
-  }
-  function mergeRemoteSettings(row, applyToDb) {
-    if (row.is_deleted) return;
-    const db = applyToDb.get();
-    db.settings = {
-      ...db.settings, currency: row.currency, theme: row.theme, accent: row.accent,
-      dateFormat: row.date_format, defaultAccount: row.default_account_id || db.settings.defaultAccount,
-      notifEnabled: row.notif_enabled, notifiedLog: row.notified_log || db.settings.notifiedLog
-    };
-    applyToDb.set(db);
+  /* ---- Called on every local save ---- */
+  async function notifyLocalChange(db) {
+    if (!uid) return; // not signed in, nothing to sync
+    db = migrateLegacyIds(db);
+    if (!navigator.onLine) {
+      OfflineBanner.show();
+      setStatus('offline');
+      await Outbox.save([{ ts: Date.now() }]); // mark that a push is owed
+      return;
+    }
+    await pushAll(db);
   }
 
-  function fromAccountRow(r) {
-    return { id: r.id, name: r.name, type: r.type, icon: r.icon, color: r.color, openingBalance: r.opening_balance };
-  }
-  function fromCategoryRow(r) {
-    return { id: r.id, name: r.name, icon: r.icon, color: r.color, locked: r.locked };
-  }
-  function fromInvestmentRow(r) {
-    return {
-      id: r.id, name: r.name, category: r.category, purchaseDate: r.purchase_date,
-      purchasePrice: r.purchase_price, quantity: r.quantity, investedAmount: r.invested_amount,
-      currentValue: r.current_value, notes: r.notes, history: r.history || [],
-      linkedExpenseId: r.linked_expense_id, txnId: r.txn_id, closed: r.closed
-    };
-  }
-  function fromTransactionRow(r, db) {
-    return {
-      id: r.id, date: r.date, amount: r.amount, accountId: r.account_id,
-      category: resolveCategoryName(db, r.type, r.category_id) || '',
-      notes: r.notes, tags: r.tags || [], location: r.location, attachment: r.attachment,
-      credit: r.credit, loan: r.loan, reminder: r.reminder, linkedInvestmentId: r.linked_investment_id,
-      realizedPL: r.realized_pl, txnId: r.txn_id
-    };
-  }
-
-  /* ---- Lifecycle ---- */
-  async function init(applyToDb, rerender) {
-    started = true;
-    lastSnapshot = snapshotOf(applyToDb.get());
-
-    // Automatic login: the Supabase client persists its session in the browser
-    // (persistSession:true, configured in getClient()) and refreshes it silently
-    // (autoRefreshToken:true) — so a valid session is simply already here on load,
-    // with no action needed from the user.
-    session = await SupaService.getSession();
-    setStatus(session ? (navigator.onLine ? 'syncing' : 'offline') : 'signed-out');
-
-    SupaService.onAuthStateChange(async (event, s) => {
-      // Fired when the user opens a "reset password" email link. Show the
-      // "set a new password" form instead of treating this as a normal sign-in.
-      if (event === 'PASSWORD_RECOVERY') {
-        recoveryMode = true;
-        rerender && rerender();
-        return;
-      }
-      const wasSignedOut = !session;
-      session = s;
-      if (!s) {
-        // Automatic logout: fires whenever Supabase invalidates the session
-        // (explicit sign-out, or a refresh token that's expired/been revoked).
-        recoveryMode = false;
-        // Clear local data so stale data is not shown after logout
-        await IDB.set('app_state', null);
-        await IDB.set('outbox', []);
-        await IDB.set('sync_meta', { lastPulledAt: {} });
-        lastSnapshot = null;
-        setStatus('signed-out');
-        rerender && rerender();
-        return;
-      }
-      if (wasSignedOut) {
-        // On every sign-in: server always wins.
-        // Clear local outbox and sync meta so stale/legacy data is never pushed.
-        // Fresh pull from Supabase is the single source of truth.
-        await IDB.set('outbox', []);
-        await IDB.set('sync_meta', { lastPulledAt: {} });
-        await IDB.set('app_state', null);
-        lastSnapshot = null;
-      }
-      await pullRemoteChanges(applyToDb, rerender);
-      rerender && rerender(); // reflect the now-signed-in state immediately (e.g. Settings screen)
-    });
-
+  /* ---- Online/offline listeners ---- */
+  function setupNetworkListeners() {
     window.addEventListener('online', async () => {
       OfflineBanner.hide();
-      if (session) { await flush(); await pullRemoteChanges(applyToDb, rerender); }
-      else setStatus('signed-out');
+      if (!uid || !applyToDbRef) return;
+      const pending = await Outbox.load();
+      if (pending.length) await pushAll(applyToDbRef.get());
+      await pullAll();
     });
     window.addEventListener('offline', () => {
       setStatus('offline');
       OfflineBanner.show();
     });
-
-    if (!navigator.onLine) OfflineBanner.show();
-
-    if (session) {
-      // Resume any changes still sitting in the outbox from a previous
-      // session (e.g. the app was closed before they finished uploading)
-      // instead of waiting for the user's next edit to trigger a flush.
-      const pending = await SyncOutbox.load();
-      if (pending.length && navigator.onLine) await flush();
-      if (navigator.onLine) await pullRemoteChanges(applyToDb, rerender);
-    }
-
-    if (pullTimer) clearInterval(pullTimer);
-    pullTimer = setInterval(() => {
-      if (session && navigator.onLine) pullRemoteChanges(applyToDb, rerender);
-    }, 30000);
   }
 
-  async function signIn(email) { return SupaService.signInWithMagicLink(email); }
-  async function signUp(email, password) { return SupaService.signUpWithPassword(email, password); }
-  async function signInPassword(email, password) { return SupaService.signInWithPassword(email, password); }
+  /* ---- Init ---- */
+  async function init(applyToDb, rerender) {
+    applyToDbRef = applyToDb;
+    rerenderRef = rerender;
+
+    if (!navigator.onLine) { OfflineBanner.show(); setStatus('offline'); }
+    setupNetworkListeners();
+
+    SupaService.onAuthStateChange(async (event, s) => {
+      const wasSignedIn = !!uid;
+      session = s;
+      uid = s && s.user ? s.user.id : null;
+
+      if (event === 'PASSWORD_RECOVERY') { recoveryMode = true; rerenderRef && rerenderRef(); return; }
+
+      if (!uid) {
+        // Signed out (explicitly or session expired/invalidated)
+        recoveryMode = false;
+        await IDB.set(IDB_STATE_KEY, null);
+        await Outbox.clear();
+        if (pullTimer) clearInterval(pullTimer);
+        setStatus('signed-out');
+        rerenderRef && rerenderRef();
+        return;
+      }
+
+      // Signed in
+      if (!wasSignedIn) {
+        // Fresh login on this device/session: server always wins.
+        await Outbox.clear();
+      }
+      setStatus('syncing');
+      await pullAll();
+      if (pullTimer) clearInterval(pullTimer);
+      pullTimer = setInterval(pullAll, PULL_INTERVAL_MS);
+    });
+
+    // Resume existing session on page load (already-logged-in reload)
+    const existing = await SupaService.getSession();
+    if (existing && existing.user) {
+      session = existing;
+      uid = existing.user.id;
+      setStatus('syncing');
+      await pullAll();
+      if (pullTimer) clearInterval(pullTimer);
+      pullTimer = setInterval(pullAll, PULL_INTERVAL_MS);
+    } else {
+      setStatus('signed-out');
+    }
+  }
+
+  /* ---- Auth actions used by index.html ---- */
   async function signInGoogle() { return SupaService.signInWithGoogle(); }
-  async function resetPassword(email) { return SupaService.resetPasswordForEmail(email); }
+  async function signInPassword(email, pw) { return SupaService.signInPassword(email, pw); }
+  async function signUp(email, pw) { return SupaService.signUp(email, pw); }
+  async function resetPassword(email) { return SupaService.resetPassword(email); }
   async function updatePassword(pw) { return SupaService.updatePassword(pw); }
   function isPasswordRecovery() { return recoveryMode; }
   function clearRecoveryMode() { recoveryMode = false; }
+  function isSignedIn() { return !!uid; }
+  function currentEmail() { return session && session.user ? session.user.email : ''; }
+  function getStatus() { return status; }
+  function onStatusChange(fn) { statusListeners.push(fn); }
+
   async function signOut() {
     await SupaService.signOut();
-    session = null;
-    recoveryMode = false;
-    // Clear all local data so next user/login starts fresh from Supabase
-    await IDB.set('app_state', null);
-    await IDB.set('outbox', []);
-    await IDB.set('sync_meta', { lastPulledAt: {} });
-    lastSnapshot = null;
+    uid = null; session = null; recoveryMode = false;
+    if (pullTimer) clearInterval(pullTimer);
+    await IDB.set(IDB_STATE_KEY, null);
+    await Outbox.clear();
     setStatus('signed-out');
   }
-  function isSignedIn() { return !!session; }
-  function currentEmail() { return session && session.user && session.user.email; }
+
+  /* ---- Manual pull trigger (exposed for debugging / pull-to-refresh) ---- */
+  async function pull() { return pullAll(); }
 
   return {
-    init, notifyLocalChange,
-    pull: (applyToDb, rerender) => pullRemoteChanges(applyToDb, rerender),
-    signIn, signUp, signInPassword, signInGoogle,
-    resetPassword, updatePassword, isPasswordRecovery, clearRecoveryMode,
-    signOut, isSignedIn, currentEmail, getStatus, onStatusChange
+    init, notifyLocalChange, pull,
+    signInGoogle, signInPassword, signUp, resetPassword, updatePassword,
+    isPasswordRecovery, clearRecoveryMode,
+    signOut, isSignedIn, currentEmail,
+    getStatus, onStatusChange
   };
 })();
+
+window.SyncEngine = SyncEngine;
+window.SupaService = SupaService;
