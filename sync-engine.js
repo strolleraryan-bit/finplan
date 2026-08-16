@@ -64,6 +64,10 @@ const IDB = (() => {
 })();
 window.IDB = IDB;
 
+// Exposed for index.html's loadDB(), which calls IdMigration.run(db)
+// before the sync engine has even initialized.
+window.IdMigration = { run: migrateLegacyIds };
+
 /* ---------------------------------------------------------------------------
    2. UUID helpers
 --------------------------------------------------------------------------- */
