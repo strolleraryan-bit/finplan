@@ -687,16 +687,22 @@ const SyncEngine = (() => {
         // Automatic logout: fires whenever Supabase invalidates the session
         // (explicit sign-out, or a refresh token that's expired/been revoked).
         recoveryMode = false;
+        // Clear local data so stale data is not shown after logout
+        await IDB.set('app_state', null);
+        await IDB.set('outbox', []);
+        await IDB.set('sync_meta', { lastPulledAt: {} });
+        lastSnapshot = null;
         setStatus('signed-out');
         rerender && rerender();
         return;
       }
       if (wasSignedOut) {
-        // First sign-in on this device: server wins.
-        // Clear local outbox and sync meta so stale local data is not pushed.
-        // Pull from Supabase replaces local state cleanly.
+        // On every sign-in: server always wins.
+        // Clear local outbox and sync meta so stale/legacy data is never pushed.
+        // Fresh pull from Supabase is the single source of truth.
         await IDB.set('outbox', []);
         await IDB.set('sync_meta', { lastPulledAt: {} });
+        await IDB.set('app_state', null);
         lastSnapshot = null;
       }
       await pullRemoteChanges(applyToDb, rerender);
@@ -738,7 +744,17 @@ const SyncEngine = (() => {
   async function updatePassword(pw) { return SupaService.updatePassword(pw); }
   function isPasswordRecovery() { return recoveryMode; }
   function clearRecoveryMode() { recoveryMode = false; }
-  async function signOut() { await SupaService.signOut(); session = null; recoveryMode = false; setStatus('signed-out'); }
+  async function signOut() {
+    await SupaService.signOut();
+    session = null;
+    recoveryMode = false;
+    // Clear all local data so next user/login starts fresh from Supabase
+    await IDB.set('app_state', null);
+    await IDB.set('outbox', []);
+    await IDB.set('sync_meta', { lastPulledAt: {} });
+    lastSnapshot = null;
+    setStatus('signed-out');
+  }
   function isSignedIn() { return !!session; }
   function currentEmail() { return session && session.user && session.user.email; }
 
