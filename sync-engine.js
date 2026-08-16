@@ -277,16 +277,17 @@ function toTransactionRow(t, uid, db) {
     attachment: t.attachment || null, credit: t.credit || null, loan: t.loan || null,
     reminder: t.reminder || null,
     linked_investment_id: (t.linkedInvestmentId && isUUID(t.linkedInvestmentId)) ? t.linkedInvestmentId : null,
+    linked_credit_id: (t.linkedCreditId && isUUID(t.linkedCreditId)) ? t.linkedCreditId : null,
     realized_pl: t.realizedPL ?? null, txn_id: t.txnId || null,
     is_deleted: false, deleted_at: null
   };
 }
-function toSettingsRow(s, uid) {
+function toSettingsRow(s, uid, notifiedLog) {
   return {
     user_id: uid, currency: s.currency || 'INR', theme: s.theme || 'dark',
     accent: s.accent || null, date_format: s.dateFormat || 'DD/MM/YYYY',
     default_account_id: (s.defaultAccount && isUUID(s.defaultAccount)) ? s.defaultAccount : null,
-    notif_enabled: !!s.notifEnabled, notified_log: s.notifiedLog || {}
+    notif_enabled: !!s.notifEnabled, notified_log: notifiedLog || {}
   };
 }
 
@@ -318,6 +319,7 @@ function fromTransactionRow(t, accountsById, categoriesById) {
     notes: t.notes, tags: t.tags || [], location: t.location,
     attachment: t.attachment, credit: t.credit, loan: t.loan,
     reminder: t.reminder, linkedInvestmentId: t.linked_investment_id,
+    linkedCreditId: t.linked_credit_id || null,
     realizedPL: t.realized_pl, txnId: t.txn_id
   };
 }
@@ -384,7 +386,7 @@ const SyncEngine = (() => {
       ].filter(Boolean);
       await SupaService.upsert('transactions', txnRows);
 
-      if (db.settings) await SupaService.upsertSettings(toSettingsRow(db.settings, uid));
+      if (db.settings) await SupaService.upsertSettings(toSettingsRow(db.settings, uid, db.notifiedLog));
 
       await Outbox.clear();
       setStatus('synced');
@@ -449,9 +451,10 @@ const SyncEngine = (() => {
           accent: settingsRow.accent,
           dateFormat: settingsRow.date_format || db.settings.dateFormat,
           defaultAccount: settingsRow.default_account_id,
-          notifEnabled: !!settingsRow.notif_enabled,
-          notifiedLog: settingsRow.notified_log || {}
+          notifEnabled: !!settingsRow.notif_enabled
         };
+        // notifiedLog lives at db.notifiedLog (top-level), not db.settings.notifiedLog
+        db.notifiedLog = settingsRow.notified_log || db.notifiedLog || {};
       }
 
       applyToDbRef.set(db);
