@@ -350,6 +350,7 @@ const SyncEngine = (() => {
   let rerenderRef = null;
   let pullTimer = null;
   let pushInFlight = false;
+  let pulledOnce = false; // guards against pushing pre-pull default/seed data
 
   function setStatus(s) {
     status = s;
@@ -389,9 +390,18 @@ const SyncEngine = (() => {
       setStatus('synced');
     } catch (e) {
       console.error('[SyncEngine] push failed:', e);
-      // Keep a snapshot in outbox so we retry once back online / next save
-      await Outbox.save([{ ts: Date.now() }]);
-      setStatus('error');
+      if (e && e.code === '23505') {
+        // Unique-constraint clash (e.g. a category with the same name
+        // already exists server-side under a different id). Re-pull to
+        // adopt the server's version of that record instead of retrying
+        // the same losing insert forever.
+        pulledOnce = false;
+        await pullAll();
+      } else {
+        // Keep a marker in outbox so we retry once back online / next save
+        await Outbox.save([{ ts: Date.now() }]);
+        setStatus('error');
+      }
     } finally {
       pushInFlight = false;
     }
@@ -446,6 +456,7 @@ const SyncEngine = (() => {
 
       applyToDbRef.set(db);
       await IDB.set(SYNC_STATE_KEY, db);
+      pulledOnce = true;
       setStatus('synced');
       OfflineBanner.hide();
       rerenderRef && rerenderRef();
@@ -459,6 +470,13 @@ const SyncEngine = (() => {
   async function notifyLocalChange(db) {
     if (!uid) return; // not signed in, nothing to sync
     db = migrateLegacyIds(db);
+    if (!pulledOnce) {
+      // First pull hasn't completed yet — pushing now would send fresh
+      // default/seed data (new ids) that can collide with same-named
+      // records already on the server. Local save already happened via
+      // saveDBSilent/saveDB; the real push happens once pull finishes.
+      return;
+    }
     if (!navigator.onLine) {
       OfflineBanner.show();
       setStatus('offline');
@@ -501,6 +519,7 @@ const SyncEngine = (() => {
       if (!uid) {
         // Signed out (explicitly or session expired/invalidated)
         recoveryMode = false;
+        pulledOnce = false;
         await IDB.set(SYNC_STATE_KEY, null);
         await Outbox.clear();
         if (pullTimer) clearInterval(pullTimer);
@@ -512,6 +531,7 @@ const SyncEngine = (() => {
       // Signed in
       if (!wasSignedIn) {
         // Fresh login on this device/session: server always wins.
+        pulledOnce = false;
         await Outbox.clear();
       }
       setStatus('syncing');
@@ -549,7 +569,7 @@ const SyncEngine = (() => {
 
   async function signOut() {
     await SupaService.signOut();
-    uid = null; session = null; recoveryMode = false;
+    uid = null; session = null; recoveryMode = false; pulledOnce = false;
     if (pullTimer) clearInterval(pullTimer);
     await IDB.set(SYNC_STATE_KEY, null);
     await Outbox.clear();
