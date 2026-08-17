@@ -468,6 +468,28 @@ const SyncEngine = (() => {
 
       const db = applyToDbRef.get();
 
+      // Brand-new account scenario: Supabase genuinely has nothing yet for
+      // this user (first-ever login, or a fresh signup after the old
+      // account was deleted). In that case do NOT wipe the local
+      // default-seeded accounts/categories (Cash, Bank, default category
+      // list) that loadDB() already created — instead push them up to
+      // become the user's initial server-side data. Overwriting local with
+      // an empty pull here was the bug: it deleted the local defaults
+      // before they ever got a chance to sync, leaving both local and
+      // server empty and nothing selectable in the UI.
+      const serverIsEmpty = accounts.length === 0 && categories.length === 0 &&
+        investments.length === 0 && transactions.length === 0 && !settingsRow;
+      if (serverIsEmpty && !pulledOnce) {
+        pulledOnce = true;
+        knownIds = { accounts: new Set(), categories: new Set(), investments: new Set(), transactions: new Set() };
+        setStatus('synced');
+        OfflineBanner.hide();
+        // Seed the server with whatever local defaults/data currently exist.
+        await pushAll(db);
+        rerenderRef && rerenderRef();
+        return;
+      }
+
       db.accounts = accounts.map(fromAccountRow);
 
       const accountsById = {};
